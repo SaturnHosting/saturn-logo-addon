@@ -26,6 +26,7 @@ import meteordevelopment.orbit.EventHandler;
 
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.block.BlockState;
+import net.minecraft.client.network.PlayerListEntry;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.item.Item;
@@ -51,6 +52,10 @@ public class VerticalBuilder extends Module {
     private static final int ROTATION_PRIORITY = 50;
     private static final int MAX_RENDER = 4000;
     private static final int GLIDE_RETRY_TICKS = 10;
+    private static final int TICK_MS = 50;
+    private static final int MIN_SETTLE_MS = 500;
+    private static final int MAX_SETTLE_MS = 5000;
+    private static final int SETTLE_PADDING_MS = 100;
 
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgPlace = settings.createGroup("Placing");
@@ -94,11 +99,8 @@ public class VerticalBuilder extends Module {
         .name("delay").description("Ticks to wait after a placement batch before the next.")
         .defaultValue(0).min(0).sliderRange(0, 20).build());
     private final Setting<Integer> maxRetries = sgPlace.add(new IntSetting.Builder()
-        .name("max-retries").description("Retries for a block whose placement didn't register before giving up.")
+        .name("max-retries").description("Placement passes for a block that remains missing before giving up.")
         .defaultValue(8).min(1).sliderRange(1, 30).build());
-    private final Setting<Integer> retryDelay = sgPlace.add(new IntSetting.Builder()
-        .name("retry-delay").description("Ticks to wait for a placement to take effect before retrying it.")
-        .defaultValue(3).min(1).sliderRange(1, 20).build());
 
     private final Setting<Boolean> fly = sgFlight.add(new BoolSetting.Builder()
         .name("auto-fly")
@@ -130,9 +132,11 @@ public class VerticalBuilder extends Module {
 
     private int relMinX, relMaxX, relMinY, relMaxY, relMinZ, relMaxZ;
 
-    private final Map<BlockPos, Integer> attempts = new HashMap<>();
-    private final Map<BlockPos, Integer> lastAttempt = new HashMap<>();
+    private final Map<BlockPos, Integer> placementPasses = new HashMap<>();
+    private final Set<BlockPos> pending = new HashSet<>();
     private final Set<BlockPos> failed = new HashSet<>();
+    private boolean settling;
+    private int settleUntilTick;
 
     private boolean normalIsZ;
     private int standSign = 1;
@@ -215,13 +219,18 @@ public class VerticalBuilder extends Module {
         if (schematic == null || mc.player == null || mc.world == null) return;
         tickCounter++;
 
-        if (remaining() == 0) {
+        if (pending.isEmpty() && remaining() == 0) {
             if (!announcedComplete) {
                 if (failed.isEmpty()) info("Schematic complete, disabling.");
                 else warning("No placeable blocks remain; disabling with %d failed block(s).", failed.size());
                 announcedComplete = true;
             }
             toggle();
+            return;
+        }
+
+        if (settling) {
+            if (tickCounter >= settleUntilTick) finishSettlement();
             return;
         }
 
@@ -242,21 +251,18 @@ public class VerticalBuilder extends Module {
             BlockState desired = entry.state();
             BlockState current = mc.world.getBlockState(pos);
 
+            if (pending.contains(pos)) continue;
             if (current.equals(desired)) { clearTracking(pos); continue; }
             if (failed.contains(pos)) continue;
             if (!current.isAir() && !current.isReplaceable()) continue;
             if (eye.distanceTo(Vec3d.ofCenter(pos)) > range.get()) continue;
 
-            Integer last = lastAttempt.get(pos);
-            if (last != null && tickCounter - last < retryDelay.get()) continue;
-
-            int tries = attempts.getOrDefault(pos, 0);
-            if (tries >= maxRetries.get()) {
+            int passes = placementPasses.getOrDefault(pos, 0);
+            if (passes >= maxRetries.get()) {
                 failed.add(pos);
-                attempts.remove(pos);
-                lastAttempt.remove(pos);
-                warning("Gave up on block at %d, %d, %d after %d attempts.",
-                    pos.getX(), pos.getY(), pos.getZ(), tries);
+                placementPasses.remove(pos);
+                warning("Gave up on block at %d, %d, %d after %d placement passes.",
+                    pos.getX(), pos.getY(), pos.getZ(), passes);
                 continue;
             }
 
@@ -269,13 +275,93 @@ public class VerticalBuilder extends Module {
             boolean attempted = place(pos, found);
 
             if (attempted) {
-                attempts.put(pos, tries + 1);
-                lastAttempt.put(pos, tickCounter);
+                pending.add(pos);
+                placementPasses.put(pos, passes + 1);
                 placed++;
             }
         }
 
         if (placed > 0) delayTimer = delay.get();
+        if (!hasAttemptableUnsentTargets()) beginSettlement();
+    }
+
+    private boolean hasAttemptableUnsentTargets() {
+        Vec3d eye = mc.player.getEyePos();
+        boolean canAutoTravel = fly.get() && (mc.player.isGliding()
+            || mc.player.getEquippedStack(EquipmentSlot.CHEST).contains(DataComponentTypes.GLIDER));
+
+        for (Schematic.Entry entry : schematic.entries) {
+            BlockPos pos = worldPos(entry.pos());
+            if (!isAttemptableTarget(entry, pos)) continue;
+            if (eye.distanceTo(Vec3d.ofCenter(pos)) > range.get() && !canAutoTravel) continue;
+
+            return true;
+        }
+        return false;
+    }
+
+    private boolean isAttemptableTarget(Schematic.Entry entry, BlockPos pos) {
+        if (pending.contains(pos) || failed.contains(pos)) return false;
+
+        BlockState current = mc.world.getBlockState(pos);
+        if (current.equals(entry.state()) || (!current.isAir() && !current.isReplaceable())) return false;
+
+        Item item = entry.state().getBlock().asItem();
+        if (item == Items.AIR || !InvUtils.findInHotbar(item).found()) return false;
+
+        return airPlace.get() || (BlockUtils.getPlaceSide(pos) != null
+            && BlockUtils.canPlaceBlock(pos, true, entry.state().getBlock()));
+    }
+
+    private void beginSettlement() {
+        settling = true;
+        settleUntilTick = tickCounter + settleTicks();
+        setVertical(0);
+    }
+
+    private void finishSettlement() {
+        for (Schematic.Entry entry : schematic.entries) {
+            BlockPos pos = worldPos(entry.pos());
+            BlockState current = mc.world.getBlockState(pos);
+
+            if (current.equals(entry.state())) {
+                clearTracking(pos);
+                continue;
+            }
+
+            if (!current.isAir() && !current.isReplaceable()) {
+                pending.remove(pos);
+                placementPasses.remove(pos);
+                if (failed.add(pos)) {
+                    warning("Cannot place block at %d, %d, %d because the position is occupied.",
+                        pos.getX(), pos.getY(), pos.getZ());
+                }
+                continue;
+            }
+
+            if (!pending.remove(pos)) continue;
+            int passes = placementPasses.getOrDefault(pos, 0);
+            if (passes >= maxRetries.get()) {
+                placementPasses.remove(pos);
+                failed.add(pos);
+                warning("Gave up on block at %d, %d, %d after %d placement passes.",
+                    pos.getX(), pos.getY(), pos.getZ(), passes);
+            }
+        }
+
+        settling = false;
+    }
+
+    private int settleTicks() {
+        int pingMs = 0;
+        if (mc.getNetworkHandler() != null && mc.player != null) {
+            PlayerListEntry playerEntry = mc.getNetworkHandler().getPlayerListEntry(mc.player.getUuid());
+            if (playerEntry != null) pingMs = Math.max(0, playerEntry.getLatency());
+        }
+
+        long dynamicSettleMs = (long) pingMs * 2 + SETTLE_PADDING_MS;
+        int settleMs = (int) Math.min(MAX_SETTLE_MS, Math.max(MIN_SETTLE_MS, dynamicSettleMs));
+        return Math.max(1, (settleMs + TICK_MS - 1) / TICK_MS);
     }
 
     private void driveFly() {
@@ -383,8 +469,7 @@ public class VerticalBuilder extends Module {
         BlockPos bestPos = null;
         for (Schematic.Entry e : schematic.entries) {
             BlockPos pos = worldPos(e.pos());
-            if (failed.contains(pos)) continue;
-            if (mc.world.getBlockState(pos).equals(e.state())) continue; // already placed
+            if (!isAttemptableTarget(e, pos)) continue;
             double d = eye.squaredDistanceTo(Vec3d.ofCenter(pos));
             if (d < best) { best = d; bestPos = pos; }
         }
@@ -444,15 +529,17 @@ public class VerticalBuilder extends Module {
     }
 
     private void clearProgress() {
-        attempts.clear();
-        lastAttempt.clear();
+        placementPasses.clear();
+        pending.clear();
         failed.clear();
+        settling = false;
+        settleUntilTick = 0;
         tickCounter = 0;
     }
 
     private void clearTracking(BlockPos pos) {
-        attempts.remove(pos);
-        lastAttempt.remove(pos);
+        placementPasses.remove(pos);
+        pending.remove(pos);
         failed.remove(pos);
     }
 
