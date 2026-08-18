@@ -25,18 +25,19 @@ import meteordevelopment.meteorclient.utils.world.BlockUtils;
 import meteordevelopment.orbit.EventHandler;
 
 import net.fabricmc.loader.api.FabricLoader;
-import net.minecraft.block.BlockState;
-import net.minecraft.client.network.PlayerListEntry;
-import net.minecraft.component.DataComponentTypes;
-import net.minecraft.entity.EquipmentSlot;
-import net.minecraft.item.Item;
-import net.minecraft.item.Items;
-import net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket;
-import net.minecraft.util.Hand;
-import net.minecraft.util.hit.BlockHitResult;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Direction;
-import net.minecraft.util.math.Vec3d;
+import net.minecraft.client.multiplayer.PlayerInfo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.network.protocol.game.ServerboundPlayerCommandPacket;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.Vec3;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
@@ -182,7 +183,7 @@ public class VerticalBuilder extends Module {
         clearProgress();
         String name = schematicFile.get();
         if (name == null || name.isEmpty()) {
-            warning("No schematic selected. Drop a .litematic, .schem, or .schematic in the 'schematics' folder.");
+            warning("No schematic selected. Drop a .litematic or .schem in the 'schematics' folder.");
             return;
         }
         try {
@@ -216,7 +217,7 @@ public class VerticalBuilder extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
-        if (schematic == null || mc.player == null || mc.world == null) return;
+        if (schematic == null || mc.player == null || mc.level == null) return;
         tickCounter++;
 
         if (pending.isEmpty() && remaining() == 0) {
@@ -242,20 +243,20 @@ public class VerticalBuilder extends Module {
 
     private void placeTick() {
         int placed = 0;
-        Vec3d eye = mc.player.getEyePos();
+        Vec3 eye = mc.player.getEyePosition();
 
         for (Schematic.Entry entry : schematic.entries) {
             if (placed >= blocksPerTick.get()) break;
 
             BlockPos pos = worldPos(entry.pos());
             BlockState desired = entry.state();
-            BlockState current = mc.world.getBlockState(pos);
+            BlockState current = mc.level.getBlockState(pos);
 
             if (pending.contains(pos)) continue;
             if (current.equals(desired)) { clearTracking(pos); continue; }
             if (failed.contains(pos)) continue;
-            if (!current.isAir() && !current.isReplaceable()) continue;
-            if (eye.distanceTo(Vec3d.ofCenter(pos)) > range.get()) continue;
+            if (!current.isAir() && !current.canBeReplaced()) continue;
+            if (eye.distanceTo(Vec3.atCenterOf(pos)) > range.get()) continue;
 
             int passes = placementPasses.getOrDefault(pos, 0);
             if (passes >= maxRetries.get()) {
@@ -286,14 +287,14 @@ public class VerticalBuilder extends Module {
     }
 
     private boolean hasAttemptableUnsentTargets() {
-        Vec3d eye = mc.player.getEyePos();
-        boolean canAutoTravel = fly.get() && (mc.player.isGliding()
-            || mc.player.getEquippedStack(EquipmentSlot.CHEST).contains(DataComponentTypes.GLIDER));
+        Vec3 eye = mc.player.getEyePosition();
+        boolean canAutoTravel = fly.get() && (mc.player.isFallFlying()
+            || mc.player.getItemBySlot(EquipmentSlot.CHEST).has(DataComponents.GLIDER));
 
         for (Schematic.Entry entry : schematic.entries) {
             BlockPos pos = worldPos(entry.pos());
             if (!isAttemptableTarget(entry, pos)) continue;
-            if (eye.distanceTo(Vec3d.ofCenter(pos)) > range.get() && !canAutoTravel) continue;
+            if (eye.distanceTo(Vec3.atCenterOf(pos)) > range.get() && !canAutoTravel) continue;
 
             return true;
         }
@@ -303,8 +304,8 @@ public class VerticalBuilder extends Module {
     private boolean isAttemptableTarget(Schematic.Entry entry, BlockPos pos) {
         if (pending.contains(pos) || failed.contains(pos)) return false;
 
-        BlockState current = mc.world.getBlockState(pos);
-        if (current.equals(entry.state()) || (!current.isAir() && !current.isReplaceable())) return false;
+        BlockState current = mc.level.getBlockState(pos);
+        if (current.equals(entry.state()) || (!current.isAir() && !current.canBeReplaced())) return false;
 
         Item item = entry.state().getBlock().asItem();
         if (item == Items.AIR || !InvUtils.findInHotbar(item).found()) return false;
@@ -322,14 +323,14 @@ public class VerticalBuilder extends Module {
     private void finishSettlement() {
         for (Schematic.Entry entry : schematic.entries) {
             BlockPos pos = worldPos(entry.pos());
-            BlockState current = mc.world.getBlockState(pos);
+            BlockState current = mc.level.getBlockState(pos);
 
             if (current.equals(entry.state())) {
                 clearTracking(pos);
                 continue;
             }
 
-            if (!current.isAir() && !current.isReplaceable()) {
+            if (!current.isAir() && !current.canBeReplaced()) {
                 pending.remove(pos);
                 placementPasses.remove(pos);
                 if (failed.add(pos)) {
@@ -354,9 +355,9 @@ public class VerticalBuilder extends Module {
 
     private int settleTicks() {
         int pingMs = 0;
-        if (mc.getNetworkHandler() != null && mc.player != null) {
-            PlayerListEntry playerEntry = mc.getNetworkHandler().getPlayerListEntry(mc.player.getUuid());
-            if (playerEntry != null) pingMs = Math.max(0, playerEntry.getLatency());
+        if (mc.getConnection() != null && mc.player != null) {
+            PlayerInfo playerInfo = mc.getConnection().getPlayerInfo(mc.player.getUUID());
+            if (playerInfo != null) pingMs = Math.max(0, playerInfo.getLatency());
         }
 
         long dynamicSettleMs = (long) pingMs * 2 + SETTLE_PADDING_MS;
@@ -377,14 +378,14 @@ public class VerticalBuilder extends Module {
 
         setVertical(dy > 0.6 ? 1 : dy < -0.6 ? -1 : 0);
 
-        if (horizontal > 0.5) mc.player.setYaw((float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0));
+        if (horizontal > 0.5) mc.player.setYRot((float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0));
         mc.player.fallDistance = 0;
     }
 
     private boolean ensureGliding() {
-        if (mc.player.isGliding()) return true;
+        if (mc.player.isFallFlying()) return true;
 
-        if (!mc.player.getEquippedStack(EquipmentSlot.CHEST).contains(DataComponentTypes.GLIDER)) {
+        if (!mc.player.getItemBySlot(EquipmentSlot.CHEST).has(DataComponents.GLIDER)) {
             if (!warnedNoElytra) {
                 warnedNoElytra = true;
                 warning("Equip an elytra — VerticalBuilder flies the wall with ElytraFly.");
@@ -393,30 +394,30 @@ public class VerticalBuilder extends Module {
         }
         warnedNoElytra = false;
 
-        if (mc.player.isOnGround()) {
-            Vec3d v = mc.player.getVelocity();
-            mc.player.setVelocity(v.x, 0.42, v.z); // hop to get airborne
+        if (mc.player.onGround()) {
+            Vec3 v = mc.player.getDeltaMovement();
+            mc.player.setDeltaMovement(v.x, 0.42, v.z); // hop to get airborne
             mc.player.setOnGround(false);
             return false;
         }
 
         if (tickCounter - lastGlideAttemptTick < GLIDE_RETRY_TICKS) return false;
         lastGlideAttemptTick = tickCounter;
-        mc.getNetworkHandler().sendPacket(new ClientCommandC2SPacket(
-            mc.player, ClientCommandC2SPacket.Mode.START_FALL_FLYING));
+        mc.getConnection().send(new ServerboundPlayerCommandPacket(
+            mc.player, ServerboundPlayerCommandPacket.Action.START_FALL_FLYING));
         return false;
     }
 
     private void setVertical(int dir) {
         if (mc.options == null) return;
-        mc.options.jumpKey.setPressed(dir > 0);
-        mc.options.sneakKey.setPressed(dir < 0);
+        mc.options.keyJump.setDown(dir > 0);
+        mc.options.keyShift.setDown(dir < 0);
     }
 
     private void releaseFlightKeys() {
         if (mc.options == null) return;
-        mc.options.jumpKey.setPressed(false);
-        mc.options.sneakKey.setPressed(false);
+        mc.options.keyJump.setDown(false);
+        mc.options.keyShift.setDown(false);
     }
 
     private void enableElytra() {
@@ -464,25 +465,25 @@ public class VerticalBuilder extends Module {
     }
 
     private BlockPos nearestStandoff() {
-        Vec3d eye = mc.player.getEyePos();
+        Vec3 eye = mc.player.getEyePosition();
         double best = Double.MAX_VALUE;
         BlockPos bestPos = null;
         for (Schematic.Entry e : schematic.entries) {
             BlockPos pos = worldPos(e.pos());
             if (!isAttemptableTarget(e, pos)) continue;
-            double d = eye.squaredDistanceTo(Vec3d.ofCenter(pos));
+            double d = eye.distanceToSqr(Vec3.atCenterOf(pos));
             if (d < best) { best = d; bestPos = pos; }
         }
         if (bestPos == null) return null;
         int out = standSign * standoff.get();
-        return normalIsZ ? bestPos.add(0, 0, out) : bestPos.add(out, 0, 0);
+        return normalIsZ ? bestPos.offset(0, 0, out) : bestPos.offset(out, 0, 0);
     }
 
     private int remaining() {
         int r = 0;
         for (Schematic.Entry e : schematic.entries) {
             BlockPos pos = worldPos(e.pos());
-            if (!failed.contains(pos) && !mc.world.getBlockState(pos).equals(e.state())) r++;
+            if (!failed.contains(pos) && !mc.level.getBlockState(pos).equals(e.state())) r++;
         }
         return r;
     }
@@ -493,19 +494,19 @@ public class VerticalBuilder extends Module {
             return BlockUtils.place(pos, item, true, ROTATION_PRIORITY, true, true);
         }
 
-        Hand hand;
+        InteractionHand hand;
         boolean swapped = false;
         if (item.isOffhand()) {
-            hand = Hand.OFF_HAND;
+            hand = InteractionHand.OFF_HAND;
         } else if (item.isHotbar()) {
             InvUtils.swap(item.slot(), true);
             swapped = true;
-            hand = Hand.MAIN_HAND;
+            hand = InteractionHand.MAIN_HAND;
         } else {
             return false;
         }
 
-        Vec3d hit = Vec3d.ofCenter(pos);
+        Vec3 hit = Vec3.atCenterOf(pos);
         BlockUtils.interact(new BlockHitResult(hit, Direction.UP, pos, false), hand, true);
         if (swapped) InvUtils.swapBack();
         return true;
@@ -513,13 +514,13 @@ public class VerticalBuilder extends Module {
 
     @EventHandler
     private void onRender(Render3DEvent event) {
-        if (!render.get() || schematic == null || mc.world == null) return;
+        if (!render.get() || schematic == null || mc.level == null) return;
         int shown = 0;
         for (Schematic.Entry entry : schematic.entries) {
             if (shown >= MAX_RENDER) break;
             BlockPos pos = worldPos(entry.pos());
-            if (mc.world.getBlockState(pos).equals(entry.state())) continue;
-            event.renderer.box(pos, sideColor.get(), lineColor.get(), shapeMode.get(), 0);
+            if (mc.level.getBlockState(pos).equals(entry.state())) continue;
+            event.renderer.box(new AABB(pos), sideColor.get(), lineColor.get(), shapeMode.get(), 0);
             shown++;
         }
     }
@@ -566,8 +567,7 @@ public class VerticalBuilder extends Module {
         if (!defaultValueLookupAttempted) {
             defaultValueLookupAttempted = true;
             try {
-                // Meteor 1.21.11 has no supported setter for a Setting's reset value.
-                // This exact field is verified against the resolved 1.21.11-86 sources.
+                // Meteor 26.1.2 has no supported setter for a Setting's reset value.
                 Field f = Setting.class.getDeclaredField("defaultValue");
                 f.setAccessible(true);
                 DEFAULT_VALUE_FIELD = f;

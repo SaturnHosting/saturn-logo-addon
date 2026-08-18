@@ -22,11 +22,10 @@ repositories {
 dependencies {
     // Fabric
     minecraft(libs.minecraft)
-    mappings(variantOf(libs.yarn) { classifier("v2") })
-    modImplementation(libs.fabric.loader)
+    implementation(libs.fabric.loader)
 
     // Meteor
-    modImplementation(libs.meteor.client)
+    implementation(libs.meteor.client)
 }
 
 java {
@@ -35,11 +34,20 @@ java {
     }
 }
 
+fun toMinecraftCompat(version: String): String {
+    val match = Regex("""^(\d{2})\.([1-9]\d*)(?:\.([1-9]\d*))?$""")
+        .matchEntire(version)
+        ?: error("Invalid Minecraft version format: $version. Expected YY.D or YY.D.H")
+
+    val (year, drop, _) = match.destructured
+    return "~$year.$drop"
+}
+
 tasks {
     processResources {
         val propertyMap = mapOf(
             "version" to project.version,
-            "minecraft_version" to libs.versions.minecraft.get(),
+            "minecraft_version" to toMinecraftCompat(libs.versions.minecraft.get()),
             "jdk_version" to libs.versions.jdk.get(),
         )
 
