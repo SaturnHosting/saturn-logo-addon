@@ -20,12 +20,12 @@ import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.meteorclient.systems.modules.movement.elytrafly.ElytraFly;
 import meteordevelopment.meteorclient.utils.player.FindItemResult;
 import meteordevelopment.meteorclient.utils.player.InvUtils;
-import meteordevelopment.meteorclient.utils.player.Rotations;
 import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.meteorclient.utils.world.BlockUtils;
 import meteordevelopment.orbit.EventHandler;
 
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.client.multiplayer.PlayerInfo;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.component.DataComponents;
@@ -47,13 +47,16 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.stream.Stream;
 
 public class VerticalBuilder extends Module {
     private static final int ROTATION_PRIORITY = 50;
     private static final int MAX_RENDER = 4000;
+    private static final int GLIDE_RETRY_TICKS = 10;
+    private static final int TICK_MS = 50;
+    private static final int MIN_SETTLE_MS = 500;
+    private static final int MAX_SETTLE_MS = 5000;
+    private static final int SETTLE_PADDING_MS = 100;
 
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgPlace = settings.createGroup("Placing");
@@ -65,7 +68,12 @@ public class VerticalBuilder extends Module {
         .description("Schematic to build, loaded from the 'schematics' folder in your game directory.")
         .defaultValue("")
         .supplier(VerticalBuilder::listSchematics)
-        .onChanged(v -> { if (isActive()) load(); })
+        .onChanged(v -> {
+            if (isActive()) {
+                load();
+                reconcileElytra();
+            }
+        })
         .build()
     );
 
@@ -92,17 +100,14 @@ public class VerticalBuilder extends Module {
         .name("delay").description("Ticks to wait after a placement batch before the next.")
         .defaultValue(0).min(0).sliderRange(0, 20).build());
     private final Setting<Integer> maxRetries = sgPlace.add(new IntSetting.Builder()
-        .name("max-retries").description("Retries for a block whose placement didn't register before giving up.")
+        .name("max-retries").description("Placement passes for a block that remains missing before giving up.")
         .defaultValue(8).min(1).sliderRange(1, 30).build());
-    private final Setting<Integer> retryDelay = sgPlace.add(new IntSetting.Builder()
-        .name("retry-delay").description("Ticks to wait for a placement to take effect before retrying it.")
-        .defaultValue(3).min(1).sliderRange(1, 20).build());
 
     private final Setting<Boolean> fly = sgFlight.add(new BoolSetting.Builder()
         .name("auto-fly")
         .description("Fly to the nearest unplaced block using Meteor's ElytraFly (needs an elytra).")
         .defaultValue(true)
-        .onChanged(v -> { if (isActive()) { if (v) enableElytra(); else restoreElytra(); } })
+        .onChanged(v -> { if (isActive()) reconcileElytra(); })
         .build());
     private final Setting<Integer> standoff = sgFlight.add(new IntSetting.Builder()
         .name("standoff")
@@ -128,17 +133,21 @@ public class VerticalBuilder extends Module {
 
     private int relMinX, relMaxX, relMinY, relMaxY, relMinZ, relMaxZ;
 
-    private final Map<BlockPos, Integer> attempts = new HashMap<>();
-    private final Map<BlockPos, Integer> lastAttempt = new HashMap<>();
+    private final Map<BlockPos, Integer> placementPasses = new HashMap<>();
+    private final Set<BlockPos> pending = new HashSet<>();
     private final Set<BlockPos> failed = new HashSet<>();
+    private boolean settling;
+    private int settleUntilTick;
 
     private boolean normalIsZ;
     private int standSign = 1;
     private boolean announcedComplete;
     private boolean enabledElytra;
+    private boolean modifiedElytra;
     private boolean prevAutoPilot;
     private double prevAutoPilotMinHeight;
     private boolean warnedNoElytra;
+    private int lastGlideAttemptTick;
 
     private final ResetSync resetSync = new ResetSync();
     private class ResetSync {
@@ -157,8 +166,9 @@ public class VerticalBuilder extends Module {
         if (mc.player == null) { toggle(); return; }
         delayTimer = 0;
         warnedNoElytra = false;
+        lastGlideAttemptTick = -GLIDE_RETRY_TICKS;
         load();
-        if (fly.get()) enableElytra();
+        reconcileElytra();
     }
 
     @Override
@@ -210,12 +220,18 @@ public class VerticalBuilder extends Module {
         if (schematic == null || mc.player == null || mc.level == null) return;
         tickCounter++;
 
-        if (remaining() == 0) {
+        if (pending.isEmpty() && remaining() == 0) {
             if (!announcedComplete) {
-                info("Schematic complete, disabling.");
+                if (failed.isEmpty()) info("Schematic complete, disabling.");
+                else warning("No placeable blocks remain; disabling with %d failed block(s).", failed.size());
                 announcedComplete = true;
             }
             toggle();
+            return;
+        }
+
+        if (settling) {
+            if (tickCounter >= settleUntilTick) finishSettlement();
             return;
         }
 
@@ -236,21 +252,18 @@ public class VerticalBuilder extends Module {
             BlockState desired = entry.state();
             BlockState current = mc.level.getBlockState(pos);
 
+            if (pending.contains(pos)) continue;
             if (current.equals(desired)) { clearTracking(pos); continue; }
             if (failed.contains(pos)) continue;
             if (!current.isAir() && !current.canBeReplaced()) continue;
             if (eye.distanceTo(Vec3.atCenterOf(pos)) > range.get()) continue;
 
-            Integer last = lastAttempt.get(pos);
-            if (last != null && tickCounter - last < retryDelay.get()) continue;
-
-            int tries = attempts.getOrDefault(pos, 0);
-            if (tries >= maxRetries.get()) {
+            int passes = placementPasses.getOrDefault(pos, 0);
+            if (passes >= maxRetries.get()) {
                 failed.add(pos);
-                attempts.remove(pos);
-                lastAttempt.remove(pos);
-                warning("Gave up on block at %d, %d, %d after %d attempts.",
-                    pos.getX(), pos.getY(), pos.getZ(), tries);
+                placementPasses.remove(pos);
+                warning("Gave up on block at %d, %d, %d after %d placement passes.",
+                    pos.getX(), pos.getY(), pos.getZ(), passes);
                 continue;
             }
 
@@ -260,16 +273,96 @@ public class VerticalBuilder extends Module {
             FindItemResult found = InvUtils.findInHotbar(item);
             if (!found.found()) continue;
 
-            boolean attempted = airPlace(pos, found);
+            boolean attempted = place(pos, found);
 
             if (attempted) {
-                attempts.put(pos, tries + 1);
-                lastAttempt.put(pos, tickCounter);
+                pending.add(pos);
+                placementPasses.put(pos, passes + 1);
                 placed++;
             }
         }
 
         if (placed > 0) delayTimer = delay.get();
+        if (!hasAttemptableUnsentTargets()) beginSettlement();
+    }
+
+    private boolean hasAttemptableUnsentTargets() {
+        Vec3 eye = mc.player.getEyePosition();
+        boolean canAutoTravel = fly.get() && (mc.player.isFallFlying()
+            || mc.player.getItemBySlot(EquipmentSlot.CHEST).has(DataComponents.GLIDER));
+
+        for (Schematic.Entry entry : schematic.entries) {
+            BlockPos pos = worldPos(entry.pos());
+            if (!isAttemptableTarget(entry, pos)) continue;
+            if (eye.distanceTo(Vec3.atCenterOf(pos)) > range.get() && !canAutoTravel) continue;
+
+            return true;
+        }
+        return false;
+    }
+
+    private boolean isAttemptableTarget(Schematic.Entry entry, BlockPos pos) {
+        if (pending.contains(pos) || failed.contains(pos)) return false;
+
+        BlockState current = mc.level.getBlockState(pos);
+        if (current.equals(entry.state()) || (!current.isAir() && !current.canBeReplaced())) return false;
+
+        Item item = entry.state().getBlock().asItem();
+        if (item == Items.AIR || !InvUtils.findInHotbar(item).found()) return false;
+
+        return airPlace.get() || (BlockUtils.getPlaceSide(pos) != null
+            && BlockUtils.canPlaceBlock(pos, true, entry.state().getBlock()));
+    }
+
+    private void beginSettlement() {
+        settling = true;
+        settleUntilTick = tickCounter + settleTicks();
+        setVertical(0);
+    }
+
+    private void finishSettlement() {
+        for (Schematic.Entry entry : schematic.entries) {
+            BlockPos pos = worldPos(entry.pos());
+            BlockState current = mc.level.getBlockState(pos);
+
+            if (current.equals(entry.state())) {
+                clearTracking(pos);
+                continue;
+            }
+
+            if (!current.isAir() && !current.canBeReplaced()) {
+                pending.remove(pos);
+                placementPasses.remove(pos);
+                if (failed.add(pos)) {
+                    warning("Cannot place block at %d, %d, %d because the position is occupied.",
+                        pos.getX(), pos.getY(), pos.getZ());
+                }
+                continue;
+            }
+
+            if (!pending.remove(pos)) continue;
+            int passes = placementPasses.getOrDefault(pos, 0);
+            if (passes >= maxRetries.get()) {
+                placementPasses.remove(pos);
+                failed.add(pos);
+                warning("Gave up on block at %d, %d, %d after %d placement passes.",
+                    pos.getX(), pos.getY(), pos.getZ(), passes);
+            }
+        }
+
+        settling = false;
+    }
+
+    private int settleTicks() {
+        int pingMs = 0;
+        if (mc.getConnection() != null && mc.player != null) {
+            PlayerInfo playerInfo = mc.getConnection().getPlayerInfo(mc.player.getUUID());
+            if (playerInfo != null) pingMs = Math.max(0, playerInfo.getLatency());
+        }
+
+        long dynamicSettleMs = (long) pingMs * 2 + SETTLE_PADDING_MS;
+        int settleMs = (int) Math.min(MAX_SETTLE_MS, Math.max(MIN_SETTLE_MS, dynamicSettleMs));
+        return Math.max(1, (settleMs + TICK_MS - 1) / TICK_MS);
     }
 
     private void driveFly() {
@@ -308,6 +401,8 @@ public class VerticalBuilder extends Module {
             return false;
         }
 
+        if (tickCounter - lastGlideAttemptTick < GLIDE_RETRY_TICKS) return false;
+        lastGlideAttemptTick = tickCounter;
         mc.getConnection().send(new ServerboundPlayerCommandPacket(
             mc.player, ServerboundPlayerCommandPacket.Action.START_FALL_FLYING));
         return false;
@@ -326,22 +421,35 @@ public class VerticalBuilder extends Module {
     }
 
     private void enableElytra() {
+        if (modifiedElytra) return;
         ElytraFly ef = Modules.get().get(ElytraFly.class);
         if (ef == null) return;
         prevAutoPilot = ef.autoPilot.get();
         prevAutoPilotMinHeight = ef.autoPilotMinimumHeight.get();
+        modifiedElytra = true;
         ef.autoPilot.set(true);
         ef.autoPilotMinimumHeight.set(-128.0);
         if (!ef.isActive()) { ef.enable(); enabledElytra = true; }
     }
 
     private void restoreElytra() {
+        if (!modifiedElytra) return;
         ElytraFly ef = Modules.get().get(ElytraFly.class);
-        if (ef == null) return;
+        if (ef == null) {
+            modifiedElytra = false;
+            enabledElytra = false;
+            return;
+        }
         ef.autoPilot.set(prevAutoPilot);
         ef.autoPilotMinimumHeight.set(prevAutoPilotMinHeight);
         if (enabledElytra && ef.isActive()) ef.disable();
         enabledElytra = false;
+        modifiedElytra = false;
+    }
+
+    private void reconcileElytra() {
+        if (isActive() && schematic != null && fly.get()) enableElytra();
+        else restoreElytra();
     }
 
     private void computeOrientation() {
@@ -362,8 +470,7 @@ public class VerticalBuilder extends Module {
         BlockPos bestPos = null;
         for (Schematic.Entry e : schematic.entries) {
             BlockPos pos = worldPos(e.pos());
-            if (failed.contains(pos)) continue;
-            if (mc.level.getBlockState(pos).equals(e.state())) continue; // already placed
+            if (!isAttemptableTarget(e, pos)) continue;
             double d = eye.distanceToSqr(Vec3.atCenterOf(pos));
             if (d < best) { best = d; bestPos = pos; }
         }
@@ -375,12 +482,18 @@ public class VerticalBuilder extends Module {
     private int remaining() {
         int r = 0;
         for (Schematic.Entry e : schematic.entries) {
-            if (!mc.level.getBlockState(worldPos(e.pos())).equals(e.state())) r++;
+            BlockPos pos = worldPos(e.pos());
+            if (!failed.contains(pos) && !mc.level.getBlockState(pos).equals(e.state())) r++;
         }
         return r;
     }
 
-    private boolean airPlace(BlockPos pos, FindItemResult item) {
+    private boolean place(BlockPos pos, FindItemResult item) {
+        if (!airPlace.get()) {
+            if (BlockUtils.getPlaceSide(pos) == null) return false;
+            return BlockUtils.place(pos, item, true, ROTATION_PRIORITY, true, true);
+        }
+
         InteractionHand hand;
         boolean swapped = false;
         if (item.isOffhand()) {
@@ -417,27 +530,18 @@ public class VerticalBuilder extends Module {
     }
 
     private void clearProgress() {
-        attempts.clear();
-        lastAttempt.clear();
+        placementPasses.clear();
+        pending.clear();
         failed.clear();
+        settling = false;
+        settleUntilTick = 0;
         tickCounter = 0;
     }
 
     private void clearTracking(BlockPos pos) {
-        attempts.remove(pos);
-        lastAttempt.remove(pos);
+        placementPasses.remove(pos);
+        pending.remove(pos);
         failed.remove(pos);
-    }
-
-    private Vec3 eyeTo(Vec3 target) {
-        return target.subtract(mc.player.getEyePosition());
-    }
-
-    private static float[] yawPitch(Vec3 delta) {
-        double horizontal = Math.sqrt(delta.x * delta.x + delta.z * delta.z);
-        float yaw = (float) (Math.toDegrees(Math.atan2(delta.z, delta.x)) - 90.0);
-        float pitch = (float) -Math.toDegrees(Math.atan2(delta.y, horizontal));
-        return new float[]{yaw, pitch};
     }
 
     private void syncResetDefaultsToPlayer() {
@@ -448,19 +552,31 @@ public class VerticalBuilder extends Module {
             field.set(x, mc.player.getBlockX());
             field.set(y, mc.player.getBlockY());
             field.set(z, mc.player.getBlockZ());
-        } catch (IllegalAccessException ignored) {}
+        } catch (IllegalAccessException e) {
+            LogoBuilder.LOG.warn("Could not update Vertical Builder's reset coordinates.", e);
+            DEFAULT_VALUE_FIELD = null;
+            defaultValueLookupFailed = true;
+        }
     }
 
     private static Field DEFAULT_VALUE_FIELD;
+    private static boolean defaultValueLookupAttempted;
+    private static boolean defaultValueLookupFailed;
+
     private static Field defaultValueField() {
-        if (DEFAULT_VALUE_FIELD == null) {
+        if (!defaultValueLookupAttempted) {
+            defaultValueLookupAttempted = true;
             try {
+                // Meteor 26.1.2 has no supported setter for a Setting's reset value.
                 Field f = Setting.class.getDeclaredField("defaultValue");
                 f.setAccessible(true);
                 DEFAULT_VALUE_FIELD = f;
-            } catch (NoSuchFieldException ignored) {}
+            } catch (NoSuchFieldException | RuntimeException e) {
+                defaultValueLookupFailed = true;
+                LogoBuilder.LOG.warn("Meteor no longer exposes the Setting reset value; dynamic reset coordinates are disabled.", e);
+            }
         }
-        return DEFAULT_VALUE_FIELD;
+        return defaultValueLookupFailed ? null : DEFAULT_VALUE_FIELD;
     }
 
     private static Path schematicsDir() {
